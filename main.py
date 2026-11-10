@@ -3,12 +3,22 @@ import re
 import uuid
 import sqlite3
 import smtplib
+import io
+import csv
 from email.message import EmailMessage
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date, timedelta
 from pathlib import Path
 
 import bcrypt
 import streamlit as st
+import pandas as pd
+from openpyxl.styles import Font, PatternFill, Alignment
+from docx import Document
+from docx.shared import Inches, Pt, RGBColor
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import landscape, A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
 # =========================================================
 # TEAMTRACK — MULTI-COMPANY ISSUE TRACKER MVP
@@ -114,6 +124,20 @@ div.stButton > button[kind="primary"], div.stFormSubmitButton > button[kind="pri
   background: var(--tt-accent) !important; border-color: var(--tt-accent) !important; color: #FFFFFF !important;
 }}
 div.stButton > button[kind="primary"] p, div.stFormSubmitButton > button[kind="primary"] p {{ color: #FFFFFF !important; }}
+/* Reports & Analytics export buttons */
+[data-testid="stDownloadButton"] button {{
+  background: #705563 !important; border: 1px solid #705563 !important;
+  color: #FFFFFF !important; border-radius: 8px !important;
+  font-family: 'Poppins', sans-serif !important; font-weight: 600 !important;
+}}
+[data-testid="stDownloadButton"] button p,
+[data-testid="stDownloadButton"] button span {{ color: #FFFFFF !important; }}
+[data-testid="stDownloadButton"] button:hover {{
+  background: #4D0F28 !important; border-color: #4D0F28 !important;
+  color: #FFFFFF !important;
+}}
+[data-testid="stDownloadButton"] button:hover p,
+[data-testid="stDownloadButton"] button:hover span {{ color: #FFFFFF !important; }}
 /* Panels, metrics, forms and tabs */
 [data-testid="stVerticalBlockBorderWrapper"] {{ background: var(--tt-surface) !important; border: 1px solid var(--tt-border) !important; border-radius: 10px !important; box-shadow: var(--tt-shadow, none); }}
 [data-testid="stMetric"] {{ background: var(--tt-surface) !important; border: 1px solid var(--tt-border) !important; border-radius: 10px; padding: 16px 18px; }}
@@ -457,6 +481,152 @@ def ticket_rows(user):
         (user["company_id"],)
     )
 
+
+
+REPORT_COLUMNS = [
+    "Ticket ID", "Title", "Description", "Category", "Department", "Priority",
+    "Status", "Reported By", "Assigned To", "Due Date", "Created At",
+    "Last Updated", "Resolved At",
+]
+
+
+def build_report_dataframe(tickets):
+    """Convert company-scoped ticket rows into a stable export dataframe.
+
+    Supplying columns explicitly is important: an empty result must still have
+    the same schema so PDF, Word, Excel and CSV exports can handle zero matches.
+    """
+    records = []
+    for t in tickets:
+        records.append({
+            "Ticket ID": t["ticket_key"],
+            "Title": t["title"],
+            "Description": t["description"],
+            "Category": t["category"],
+            "Department": t["team"],
+            "Priority": t["priority"],
+            "Status": t["status"],
+            "Reported By": t["reporter_name"],
+            "Assigned To": t["assignee_name"] or "Unassigned",
+            "Due Date": t["due_date"] or "",
+            "Created At": t["created_at"],
+            "Last Updated": t["updated_at"],
+            "Resolved At": t["resolved_at"] or "",
+        })
+    return pd.DataFrame(records, columns=REPORT_COLUMNS)
+
+
+def make_excel_report(df, summary, company_name, generated_at):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        summary.to_excel(writer, index=False, sheet_name="Summary")
+        df.to_excel(writer, index=False, sheet_name="Ticket details")
+        for sheet_name in ["Summary", "Ticket details"]:
+            ws = writer.book[sheet_name]
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            for cell in ws[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="4D0F28")
+                cell.alignment = Alignment(vertical="center")
+            for column_cells in ws.columns:
+                letter = column_cells[0].column_letter
+                max_length = max((len(str(c.value or "")) for c in column_cells), default=10)
+                ws.column_dimensions[letter].width = min(max(max_length + 2, 12), 42)
+        ws = writer.book["Summary"]
+        ws.insert_rows(1, 3)
+        ws["A1"] = company_name
+        ws["A1"].font = Font(size=16, bold=True, color="4D0F28")
+        ws["A2"] = "TeamTrack report"
+        ws["A3"] = f"Generated: {generated_at}"
+    output.seek(0)
+    return output.getvalue()
+
+
+def make_word_report(df, summary, company_name, generated_at, period_label):
+    doc = Document()
+    section = doc.sections[0]
+    section.top_margin = Inches(0.65)
+    section.bottom_margin = Inches(0.65)
+    title = doc.add_heading(company_name, 0)
+    title.runs[0].font.color.rgb = RGBColor(77, 15, 40)
+    doc.add_heading("TeamTrack Reports & Analytics", level=1)
+    doc.add_paragraph(f"Reporting period: {period_label}")
+    doc.add_paragraph(f"Generated: {generated_at}")
+    doc.add_heading("Summary", level=2)
+    table = doc.add_table(rows=1, cols=2)
+    table.style = "Light Shading Accent 1"
+    table.rows[0].cells[0].text = "Metric"
+    table.rows[0].cells[1].text = "Value"
+    for _, row in summary.iterrows():
+        cells = table.add_row().cells
+        cells[0].text = str(row["Metric"])
+        cells[1].text = str(row["Value"])
+    doc.add_heading("Ticket details", level=2)
+    if df.empty:
+        doc.add_paragraph("No tickets match the selected filters.")
+    else:
+        cols = ["Ticket ID", "Title", "Department", "Priority", "Status", "Assigned To", "Created At"]
+        table = doc.add_table(rows=1, cols=len(cols))
+        table.style = "Table Grid"
+        for i, col in enumerate(cols):
+            table.rows[0].cells[i].text = col
+        for _, row in df[cols].iterrows():
+            cells = table.add_row().cells
+            for i, col in enumerate(cols):
+                cells[i].text = str(row[col])[:180]
+    output = io.BytesIO()
+    doc.save(output)
+    output.seek(0)
+    return output.getvalue()
+
+
+def make_pdf_report(df, summary, company_name, generated_at, period_label):
+    output = io.BytesIO()
+    doc = SimpleDocTemplate(output, pagesize=landscape(A4), rightMargin=28, leftMargin=28,
+                            topMargin=28, bottomMargin=28)
+    styles = getSampleStyleSheet()
+    story = [Paragraph(company_name, styles["Title"]),
+             Paragraph("TeamTrack Reports &amp; Analytics", styles["Heading1"]),
+             Paragraph(f"Reporting period: {period_label}", styles["Normal"]),
+             Paragraph(f"Generated: {generated_at}", styles["Normal"]), Spacer(1, 12),
+             Paragraph("Summary", styles["Heading2"])]
+    summary_data = [["Metric", "Value"]] + [[str(r["Metric"]), str(r["Value"])] for _, r in summary.iterrows()]
+    summary_table = Table(summary_data, colWidths=[220, 100], repeatRows=1)
+    summary_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4D0F28")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D9D4D7")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7F4F5")]),
+        ("PADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.extend([summary_table, Spacer(1, 14), Paragraph("Ticket details", styles["Heading2"])])
+    cols = ["Ticket ID", "Title", "Department", "Priority", "Status", "Assigned To", "Created At"]
+    data = [cols]
+    if not df.empty:
+        # Reindex defensively so an incomplete dataframe cannot break PDF export.
+        pdf_df = df.reindex(columns=cols, fill_value="")
+        for _, row in pdf_df.iterrows():
+            data.append([str(row[c])[:70] for c in cols])
+    if len(data) == 1:
+        data.append(["No tickets match the selected filters."] + [""] * (len(cols)-1))
+    widths = [62, 190, 85, 65, 75, 105, 105]
+    ticket_table = Table(data, colWidths=widths, repeatRows=1)
+    ticket_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4D0F28")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D9D4D7")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7F4F5")]),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("PADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(ticket_table)
+    doc.build(story)
+    output.seek(0)
+    return output.getvalue()
 
 def open_ticket(ticket_id):
     st.session_state.selected_ticket = ticket_id
@@ -1033,32 +1203,135 @@ elif page == "Team & members":
 
 
 # -----------------------------
-# REPORTS
+# REPORTS & ANALYTICS
 # -----------------------------
 elif page == "Reports":
-    st.title("Reports")
-    st.caption("A snapshot of issue volume and team workload.")
-    total = len(all_tickets)
-    if total:
-        by_status = {}
-        by_priority = {}
-        by_team = {}
-        for t in all_tickets:
-            by_status[t["status"]] = by_status.get(t["status"], 0) + 1
-            by_priority[t["priority"]] = by_priority.get(t["priority"], 0) + 1
-            by_team[t["team"]] = by_team.get(t["team"], 0) + 1
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("### Tickets by status")
-            st.bar_chart(by_status)
-        with c2:
-            st.markdown("### Tickets by priority")
-            st.bar_chart(by_priority)
-        st.markdown("### Tickets by department")
-        st.bar_chart(by_team)
-    else:
-        st.info("Reports will appear once your company starts creating tickets.")
+    st.title("Reports & Analytics")
+    st.caption("Explore ticket activity and export company reports in PDF, Word, Excel or CSV format.")
 
+    today = date.today()
+    default_start = today - timedelta(days=30)
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        start_date = st.date_input("From", value=default_start, key="report_start_date")
+    with f2:
+        end_date = st.date_input("To", value=today, key="report_end_date")
+    with f3:
+        report_team = st.selectbox("Department", ["All departments"] + teams, key="report_team_filter")
+
+    f4, f5, f6 = st.columns(3)
+    with f4:
+        report_status = st.selectbox("Status", ["All statuses"] + STATUSES, key="report_status_filter")
+    with f5:
+        report_priority = st.selectbox("Priority", ["All priorities"] + PRIORITIES, key="report_priority_filter")
+    with f6:
+        member_labels = {"All employees": None}
+        for m in members:
+            member_labels[f"{m['full_name']} ({m['team']})"] = m["id"]
+        selected_member_label = st.selectbox("Employee", list(member_labels.keys()), key="report_member_filter")
+        selected_member_id = member_labels[selected_member_label]
+
+    if start_date > end_date:
+        st.error("The start date must be on or before the end date.")
+        filtered_tickets = []
+    else:
+        filtered_tickets = []
+        for ticket in all_tickets:
+            created_day = (ticket["created_at"] or "")[:10]
+            if not created_day or not (start_date.isoformat() <= created_day <= end_date.isoformat()):
+                continue
+            if report_team != "All departments" and ticket["team"] != report_team:
+                continue
+            if report_status != "All statuses" and ticket["status"] != report_status:
+                continue
+            if report_priority != "All priorities" and ticket["priority"] != report_priority:
+                continue
+            if selected_member_id and selected_member_id not in [ticket["reporter_id"], ticket["assignee_id"]]:
+                continue
+            filtered_tickets.append(ticket)
+
+    report_df = build_report_dataframe(filtered_tickets)
+    total = len(filtered_tickets)
+    active_count = sum(t["status"] not in ["Resolved", "Closed"] for t in filtered_tickets)
+    resolved_count = sum(t["status"] in ["Resolved", "Closed"] for t in filtered_tickets)
+    overdue_count = sum(bool(t["due_date"]) and t["due_date"] < today.isoformat()
+                        and t["status"] not in ["Resolved", "Closed"] for t in filtered_tickets)
+    resolution_rate = round((resolved_count / total) * 100, 1) if total else 0
+    summary_df = pd.DataFrame([
+        {"Metric": "Total tickets", "Value": total},
+        {"Metric": "Active tickets", "Value": active_count},
+        {"Metric": "Resolved or closed", "Value": resolved_count},
+        {"Metric": "Overdue tickets", "Value": overdue_count},
+        {"Metric": "Resolution rate", "Value": f"{resolution_rate}%"},
+    ])
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Total tickets", total)
+    m2.metric("Active", active_count)
+    m3.metric("Resolved / closed", resolved_count)
+    m4.metric("Overdue", overdue_count)
+    m5.metric("Resolution rate", f"{resolution_rate}%")
+
+    if total:
+        status_counts = report_df["Status"].value_counts().reindex(STATUSES, fill_value=0)
+        priority_counts = report_df["Priority"].value_counts().reindex(PRIORITIES, fill_value=0)
+        team_counts = report_df["Department"].value_counts()
+        chart1, chart2 = st.columns(2)
+        with chart1:
+            st.markdown("### Tickets by status")
+            st.bar_chart(status_counts)
+        with chart2:
+            st.markdown("### Tickets by priority")
+            st.bar_chart(priority_counts)
+        st.markdown("### Department workload")
+        st.bar_chart(team_counts)
+        st.markdown("### Ticket details")
+        visible_columns = ["Ticket ID", "Title", "Department", "Priority", "Status", "Reported By", "Assigned To", "Due Date", "Created At"]
+        st.dataframe(report_df[visible_columns], use_container_width=True, hide_index=True)
+    else:
+        st.info("No tickets match the selected reporting filters. You can still export an empty report with its summary.")
+
+    st.markdown("---")
+    st.markdown("### Export report")
+    generated_at = datetime.now().strftime("%d %b %Y, %H:%M")
+    period_label = f"{start_date.strftime('%d %b %Y')} – {end_date.strftime('%d %b %Y')}" if start_date <= end_date else "Invalid date range"
+    file_stub = re.sub(r"[^A-Za-z0-9_-]+", "_", company_name).strip("_") or "Company"
+    export1, export2, export3, export4 = st.columns(4)
+    with export1:
+        try:
+            pdf_bytes = make_pdf_report(report_df, summary_df, company_name, generated_at, period_label)
+            st.download_button("Download PDF", data=pdf_bytes,
+                               file_name=f"{file_stub}_TeamTrack_Report.pdf",
+                               mime="application/pdf", use_container_width=True,
+                               disabled=start_date > end_date)
+        except Exception as exc:
+            st.error(f"PDF export unavailable: {exc}")
+    with export2:
+        try:
+            word_bytes = make_word_report(report_df, summary_df, company_name, generated_at, period_label)
+            st.download_button("Download Word", data=word_bytes,
+                               file_name=f"{file_stub}_TeamTrack_Report.docx",
+                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                               use_container_width=True, disabled=start_date > end_date)
+        except Exception as exc:
+            st.error(f"Word export unavailable: {exc}")
+    with export3:
+        try:
+            excel_bytes = make_excel_report(report_df, summary_df, company_name, generated_at)
+            st.download_button("Download Excel", data=excel_bytes,
+                               file_name=f"{file_stub}_TeamTrack_Report.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               use_container_width=True, disabled=start_date > end_date)
+        except Exception as exc:
+            st.error(f"Excel export unavailable: {exc}")
+    with export4:
+        csv_buffer = io.StringIO()
+        report_df.to_csv(csv_buffer, index=False)
+        st.download_button("Download CSV", data=csv_buffer.getvalue().encode("utf-8-sig"),
+                           file_name=f"{file_stub}_TeamTrack_Tickets.csv",
+                           mime="text/csv", use_container_width=True,
+                           disabled=start_date > end_date)
+    st.caption("Exports contain only tickets belonging to the signed-in user's company workspace and matching the selected filters. Date filtering uses ticket creation date.")
 
 # -----------------------------
 # WORKSPACE SETTINGS
