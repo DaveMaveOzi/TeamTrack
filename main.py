@@ -86,8 +86,18 @@ html, body, [class*="css"], [data-testid="stAppViewContainer"] {{
 [data-testid="stSidebar"] > div:first-child {{ background: var(--tt-sidebar) !important; }}
 [data-testid="stSidebar"] * {{ color: var(--tt-text); font-family: 'Poppins', sans-serif !important; }}
 [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {{ color: var(--tt-muted); }}
-[data-testid="stSidebar"] button {{ text-align: left; border-radius: 8px !important; }}
-[data-testid="stSidebar"] [data-testid="stButton"] button {{ min-height: 2.55rem; }}
+/* Sidebar navigation: identical left edge, width, padding and text alignment. */
+[data-testid="stSidebar"] [data-testid="stButton"] {{ width: 100% !important; }}
+[data-testid="stSidebar"] [data-testid="stButton"] > button {{
+  width: 100% !important; min-height: 2.55rem; display: flex !important;
+  align-items: center !important; justify-content: flex-start !important;
+  text-align: left !important; padding: 0.55rem 0.85rem !important;
+  margin: 0 !important; border-radius: 8px !important;
+}}
+[data-testid="stSidebar"] [data-testid="stButton"] > button div,
+[data-testid="stSidebar"] [data-testid="stButton"] > button p {{
+  width: 100% !important; text-align: left !important; margin-left: 0 !important;
+}}
 [data-testid="stSidebar"] button[kind="primary"] {{ background: var(--tt-soft) !important; color: var(--tt-accent) !important; border: 1px solid var(--tt-border) !important; font-weight: 600; }}
 [data-testid="stSidebar"] button[kind="secondary"] {{ background: transparent !important; color: var(--tt-text) !important; border: 1px solid transparent !important; }}
 [data-testid="stSidebar"] button[kind="secondary"]:hover {{ background: var(--tt-surface-alt) !important; border-color: var(--tt-border) !important; }}
@@ -462,13 +472,12 @@ def status_badge(status):
         "Open": "#e9efff", "Assigned": "#e9efff", "In Progress": "#fff2d8",
         "On Hold": "#f1eaff", "Resolved": "#e4f7ed", "Closed": "#eef0f3"
     }
-    return f'<span style="background:{colors.get(status, "#eee")};padding:4px 9px;border-radius:20px;font-size:12px;font-weight:600">{status}</span>'
+    return f'<span style="background:{colors.get(status, "#eee")};color:#4D0F28;padding:4px 9px;border-radius:20px;font-size:12px;font-weight:700">{status}</span>'
 
 
 def priority_badge(priority):
     colors = {"Critical": "#ffe5e5", "High": "#fff0e2", "Medium": "#fff8d9", "Low": "#e8f3ff"}
-    return f'<span style="background:{colors.get(priority, "#eee")};padding:4px 9px;border-radius:20px;font-size:12px;font-weight:600">{priority}</span>'
-
+    return f'<span style="background:{colors.get(priority, "#eee")};color:#4D0F28;padding:4px 9px;border-radius:20px;font-size:12px;font-weight:700">{priority}</span>' 
 
 def ticket_rows(user):
     return q_all(
