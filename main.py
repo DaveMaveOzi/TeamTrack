@@ -28,6 +28,7 @@ APP_DIR = Path(__file__).parent
 DB_PATH = APP_DIR / "teamtrack.db"
 UPLOAD_DIR = APP_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
+LOGO_PATH = APP_DIR / "teamtrack_logo.png"
 
 STATUSES = ["Open", "Assigned", "In Progress", "On Hold", "Resolved", "Closed"]
 PRIORITIES = ["Critical", "High", "Medium", "Low"]
@@ -667,9 +668,10 @@ if not st.session_state.user:
         padding:28px 30px 26px !important;
         box-shadow:var(--tt-shadow) !important;
     }
-    .teamtrack-auth-brand {text-align:center; padding:28px 0 12px;}
-    .teamtrack-auth-brand .wordmark {font-size:29px; font-weight:800; letter-spacing:-1.2px; color:#4D0F28;}
-    .teamtrack-auth-brand .tagline {font-size:13px; color:var(--tt-muted); margin-top:5px;}
+    .teamtrack-auth-brand {display:flex; align-items:center; min-height:48px; padding:2px 0 6px;}
+    .teamtrack-auth-brand img {display:block; width:40px; max-width:40px; height:auto; object-fit:contain;}
+    .teamtrack-workspace-wordmark {font-size:25px; line-height:1.2; font-weight:800; letter-spacing:-1.05px; color:var(--tt-accent) !important; margin:2px 0 14px; padding:4px 2px;}
+    .teamtrack-auth-page-wordmark {font-size:27px; line-height:1.2; font-weight:800; letter-spacing:-1.1px; color:var(--tt-accent) !important; text-align:center; margin:0 0 14px; padding:2px 0;}
     .teamtrack-auth-heading {text-align:center; margin:5px 0 20px;}
     .teamtrack-auth-heading h2 {font-size:24px; margin:0 0 6px; letter-spacing:-.8px;}
     .teamtrack-auth-heading p {font-size:13px; color:var(--tt-muted) !important; margin:0;}
@@ -683,15 +685,20 @@ if not st.session_state.user:
     .st-key-teamtrack_auth_card [data-testid="stCaptionContainer"] p {color:var(--tt-muted) !important;}
     .st-key-teamtrack_auth_card [data-testid="stAlert"] {border-radius:9px !important;}
     @media(max-width:700px) {
-      .teamtrack-auth-brand {padding-top:10px;}
+      .teamtrack-auth-brand {min-height:44px; padding-top:0;}
+      .teamtrack-auth-brand img {width:36px; max-width:36px;}
       .st-key-teamtrack_auth_card [data-testid="stVerticalBlockBorderWrapper"] {padding:20px 16px !important;}
     }
     </style>
     """, unsafe_allow_html=True)
 
-    # Theme control sits separately from the auth card, like the public
-    # account experience in VENTICK. The selected theme is kept in session.
-    theme_spacer, theme_control = st.columns([5, 1])
+    # Small transparent brand mark at the top-left; theme control stays top-right.
+    brand_col, theme_control = st.columns([5, 1], vertical_alignment="center")
+    with brand_col:
+        if LOGO_PATH.exists():
+            st.image(str(LOGO_PATH), width=40)
+        else:
+            st.markdown("<div class='teamtrack-workspace-wordmark'>TeamTrack</div>", unsafe_allow_html=True)
     with theme_control:
         theme_toggle = st.toggle(
             "Dark mode",
@@ -703,15 +710,9 @@ if not st.session_state.user:
         st.session_state.teamtrack_theme = selected_theme
         st.rerun()
 
-    st.markdown("""
-    <div class="teamtrack-auth-brand">
-      <div class="wordmark">TEAMTRACK</div>
-      <div class="tagline">A clearer way to keep work moving.</div>
-    </div>
-    """, unsafe_allow_html=True)
-
     left, centre, right = st.columns([1.1, 1.45, 1.1])
     with centre:
+        st.markdown("<div class='teamtrack-auth-page-wordmark'>TeamTrack</div>", unsafe_allow_html=True)
         with st.container(border=True, key="teamtrack_auth_card"):
             if "teamtrack_auth_mode" not in st.session_state:
                 st.session_state.teamtrack_auth_mode = "signin"
@@ -835,7 +836,7 @@ if not st.session_state.user:
                         else:
                             st.error(result)
 
-        st.markdown("<div class='teamtrack-auth-foot'>TEAMTRACK · Your team's work, in one place.</div>", unsafe_allow_html=True)
+        st.markdown("<div class='teamtrack-auth-foot'>TeamTrack · Your team's work, in one place.</div>", unsafe_allow_html=True)
     st.stop()
 
 
@@ -863,7 +864,11 @@ if st.session_state.get("teamtrack_created_join_code"):
         st.rerun()
 
 with st.sidebar:
-    st.markdown("## TeamTrack")
+    # Compact graphic logo replaces the text wordmark after authentication.
+    if LOGO_PATH.exists():
+        st.image(str(LOGO_PATH), width=40)
+    else:
+        st.markdown("<div class='teamtrack-workspace-wordmark'>TeamTrack</div>", unsafe_allow_html=True)
     st.caption(company_name)
     workspace_dark_mode = st.toggle(
         "Dark mode",
