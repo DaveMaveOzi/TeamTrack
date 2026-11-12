@@ -5,6 +5,7 @@ import sqlite3
 import smtplib
 import io
 import csv
+import html
 from email.message import EmailMessage
 from datetime import datetime, timezone, date, timedelta
 from pathlib import Path
@@ -65,6 +66,49 @@ else:
         "accent_hover": "#681B39", "accent_text": "#FFFFFF", "soft": "#F4E9EE",
         "shadow": "0 5px 18px rgba(35,20,28,.045)",
     }
+
+# Light-mode status cards: keep the success and invitation-code cards readable.
+# Dark mode is intentionally left unchanged.
+LIGHT_MODE_CARD_CSS = ""
+if not DARK_MODE:
+    LIGHT_MODE_CARD_CSS = """
+.tt-created-success-card {
+  background: #187A45 !important;
+  color: #FFFFFF !important;
+  border: 1px solid #187A45 !important;
+  border-radius: 9px;
+  padding: 0.85rem 1rem;
+  font-weight: 600;
+  margin: 0.25rem 0 0.75rem;
+}
+.tt-created-success-card * { color: #FFFFFF !important; }
+[data-testid="stCodeBlock"] {
+  background: #173B63 !important;
+  border: 1px solid #173B63 !important;
+  border-radius: 9px !important;
+}
+[data-testid="stCodeBlock"] pre,
+[data-testid="stCodeBlock"] code,
+[data-testid="stCodeBlock"] span {
+  background: transparent !important;
+  color: #FFFFFF !important;
+}
+[data-testid="stCodeBlock"] button,
+[data-testid="stCodeBlock"] button svg {
+  color: #FFFFFF !important;
+  fill: #FFFFFF !important;
+}
+.tt-workspace-settings-note {
+  background: #173B63 !important;
+  color: #FFFFFF !important;
+  border: 1px solid #173B63 !important;
+  border-radius: 9px;
+  padding: 0.9rem 1rem;
+  line-height: 1.55;
+  margin: 0.35rem 0 0.75rem;
+}
+.tt-workspace-settings-note * { color: #FFFFFF !important; }
+"""
 
 st.markdown(f"""
 <style>
@@ -179,6 +223,7 @@ div.stButton > button[kind="primary"] p, div.stFormSubmitButton > button[kind="p
 [data-testid="stSidebar"] [data-testid="collapsedControl"],
 [data-testid="stSidebar"] button[kind="header"] {{ display: none !important; }}
 @media (max-width: 800px) {{ [data-testid="stMainBlockContainer"] {{ padding: 1rem; }} }}
+{LIGHT_MODE_CARD_CSS}
 </style>
 """, unsafe_allow_html=True)
 
@@ -856,7 +901,7 @@ unread = q_one("SELECT COUNT(*) AS n FROM notifications WHERE user_id=? AND is_r
 # Show the new workspace invitation code once the first Admin has created
 # a company, so they can share it with colleagues.
 if st.session_state.get("teamtrack_created_join_code"):
-    st.success(f"{company_name} workspace created successfully.")
+    st.markdown(f"<div class='tt-created-success-card'>{html.escape(company_name)} workspace created successfully.</div>", unsafe_allow_html=True)
     st.markdown("**Your company invitation code**")
     st.code(st.session_state.teamtrack_created_join_code, language=None)
     if st.button("I've saved the invitation code", key="dismiss_created_code"):
@@ -1355,7 +1400,7 @@ elif page == "Workspace settings":
     st.caption("Company workspace information and access details.")
     st.text_input("Company name", value=company_name, disabled=True)
     st.text_input("Company invitation code", value=user["join_code"], disabled=True)
-    st.info("For this MVP, workspace identity and invitation codes are read-only. More advanced access controls will be added in a later iteration.")
+    st.markdown("<div class='tt-workspace-settings-note'>Workspace identity and invitation codes are currently read-only in this MVP. Advanced workspace access and management controls will be introduced in a future update.</div>", unsafe_allow_html=True)
 
 st.markdown("---")
 st.caption("TeamTrack MVP · Keep work visible. Keep teams moving.")

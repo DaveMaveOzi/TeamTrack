@@ -2,13 +2,9 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
-*.db
-*.sqlite
-*.sqlite3
-uploads/
 .env
+teamtrack.db
+teamtrack.db-shm
+teamtrack.db-wal
+uploads/
 .streamlit/secrets.toml
-.idea/
-.vscode/
-.DS_Store
-Thumbs.db
