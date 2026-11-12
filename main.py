@@ -7,12 +7,15 @@ import io
 import csv
 import base64
 import html
+import hashlib
+import secrets
 from email.message import EmailMessage
 from datetime import datetime, timezone, date, timedelta
 from pathlib import Path
 
 import bcrypt
 import streamlit as st
+import extra_streamlit_components as stx
 import pandas as pd
 from openpyxl.styles import Font, PatternFill, Alignment
 from docx import Document
@@ -332,6 +335,14 @@ def init_db():
             created_at TEXT NOT NULL,
             FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS login_sessions (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
         """)
         con.commit()
 
@@ -344,6 +355,41 @@ def q_one(sql, params=()):
 def q_all(sql, params=()):
     with db() as con:
         return con.execute(sql, params).fetchall()
+
+
+def create_persistent_login(user_id):
+    """Create a revocable 30-day browser session; only its hash is stored."""
+    raw_token = secrets.token_urlsafe(48)
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    expires = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(timespec="seconds")
+    with db() as con:
+        con.execute("DELETE FROM login_sessions WHERE expires_at < ?", (now(),))
+        con.execute(
+            "INSERT INTO login_sessions (id,user_id,token_hash,expires_at,created_at) VALUES (?,?,?,?,?)",
+            (str(uuid.uuid4()), user_id, token_hash, expires, now())
+        )
+        con.commit()
+    st.session_state.teamtrack_auth_token = raw_token
+    cookie_manager.set("teamtrack_session", raw_token,
+                       expires_at=datetime.now(timezone.utc) + timedelta(days=30))
+
+
+def restore_persistent_login(raw_token):
+    if not raw_token or not isinstance(raw_token, str):
+        return None
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    record = q_one(
+        """SELECT u.*, c.name AS company_name, c.join_code
+           FROM login_sessions s
+           JOIN users u ON u.id=s.user_id
+           JOIN companies c ON c.id=u.company_id
+           WHERE s.token_hash=? AND s.expires_at>? AND u.active=1""",
+        (token_hash, now())
+    )
+    if record:
+        st.session_state.teamtrack_auth_token = raw_token
+        return dict(record)
+    return None
 
 
 def execute(sql, params=()):
@@ -476,7 +522,17 @@ def complete_password_reset(raw_token, new_password):
 
 
 def notify_users(company_id, user_ids, ticket_id, message, subject="TeamTrack update"):
-    unique_ids = list(dict.fromkeys([x for x in user_ids if x]))
+    # Enforce notification scope at the write boundary: only active users in
+    # the ticket's assigned department and its directly assigned individual.
+    ticket = q_one("SELECT team, assignee_id FROM tickets WHERE id=? AND company_id=?", (ticket_id, company_id))
+    if not ticket:
+        return
+    eligible_rows = q_all(
+        "SELECT id FROM users WHERE company_id=? AND active=1 AND (team=? OR id=?)",
+        (company_id, ticket["team"], ticket["assignee_id"] or "")
+    )
+    eligible_ids = {row["id"] for row in eligible_rows}
+    unique_ids = list(dict.fromkeys([x for x in user_ids if x and x in eligible_ids]))
     with db() as con:
         for uid in unique_ids:
             con.execute(
@@ -504,8 +560,8 @@ def ticket_notification_recipients(company_id, team, reporter_id=None, assignee_
         (company_id, team)
     )
     recipients = {row["id"] for row in rows}
-    if reporter_id:
-        recipients.add(reporter_id)
+    # The reporter is not added separately when they belong to another
+    # department; department membership and direct assignment define scope.
     if assignee_id:
         recipients.add(assignee_id)
     if exclude_user_id:
@@ -605,7 +661,15 @@ def login(email, password, company_code=""):
 
 
 def logout():
-    for key in ["user", "page", "selected_ticket"]:
+    raw_token = st.session_state.get("teamtrack_auth_token")
+    if raw_token:
+        token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        execute("DELETE FROM login_sessions WHERE token_hash=?", (token_hash,))
+    try:
+        cookie_manager.delete("teamtrack_session")
+    except Exception:
+        pass
+    for key in ["user", "page", "selected_ticket", "teamtrack_auth_token"]:
         st.session_state.pop(key, None)
     st.rerun()
 
@@ -825,8 +889,24 @@ def open_ticket(ticket_id):
 # -----------------------------
 init_db()
 
+# A secure random token stored in a browser cookie keeps a signed-in user
+# authenticated after a normal page refresh. The database stores only its hash.
+cookie_manager = stx.CookieManager(key="teamtrack_auth_cookie_manager")
+try:
+    cookie_manager.get_all()  # initialise/read browser cookies after a full page refresh
+except Exception:
+    pass
 if "user" not in st.session_state:
     st.session_state.user = None
+if not st.session_state.user:
+    try:
+        browser_token = cookie_manager.get("teamtrack_session")
+        restored_user = restore_persistent_login(browser_token)
+        if restored_user:
+            st.session_state.user = restored_user
+    except Exception:
+        # If the browser cookie component is unavailable, normal sign-in remains available.
+        pass
 
 # A password-reset link opens a dedicated form before the normal sign-in view.
 reset_token = st.query_params.get("reset", "")
@@ -1052,6 +1132,7 @@ if not st.session_state.user:
                     user = login(email, password, company_code)
                     if user:
                         st.session_state.user = dict(user)
+                        create_persistent_login(user["id"])
                         st.session_state.page = "Overview"
                         st.rerun()
                     else:
@@ -1119,6 +1200,7 @@ if not st.session_state.user:
                                    FROM users u JOIN companies c ON c.id=u.company_id WHERE u.id=?""",
                                 (user_id,)
                             ))
+                            create_persistent_login(user_id)
                             st.session_state.page = "Overview"
                             st.rerun()
                         else:
@@ -1158,6 +1240,7 @@ if not st.session_state.user:
                                    FROM users u JOIN companies c ON c.id=u.company_id WHERE u.id=?""",
                                 (user_id,)
                             ))
+                            create_persistent_login(user_id)
                             st.session_state.page = "Overview"
                             st.rerun()
                         else:
@@ -1198,7 +1281,13 @@ if not teams:
 all_tickets = ticket_rows(user)
 if user["role"] == "Team Lead":
     all_tickets = [ticket for ticket in all_tickets if ticket["team"] == user["team"]]
-unread = q_one("SELECT COUNT(*) AS n FROM notifications WHERE user_id=? AND is_read=0", (user["id"],))["n"]
+unread = q_one(
+    """SELECT COUNT(*) AS n FROM notifications n
+       LEFT JOIN tickets t ON t.id=n.ticket_id
+       WHERE n.user_id=? AND n.is_read=0
+         AND (n.ticket_id IS NULL OR t.id IS NULL OR t.team=? OR t.assignee_id=?)""",
+    (user["id"], user["team"], user["id"])
+)["n"]
 
 # Show the new workspace invitation code once the first Admin has created
 # a company, so they can share it with colleagues.
@@ -1426,7 +1515,9 @@ elif page == "Ticket details":
                     st.caption(comment["created_at"][:16].replace("T", " "))
             submitted = False
             comment_body = ""
-            if user["role"] != "Viewer":
+            if t["status"] == "Closed":
+                st.info("This ticket is closed and read-only. Create a new ticket if further work is required.")
+            elif user["role"] != "Viewer":
                 with st.form("comment_form"):
                     comment_body = st.text_area("Add a comment or progress update")
                     submitted = st.form_submit_button("Post comment", type="primary")
@@ -1496,13 +1587,19 @@ elif page == "Ticket details":
                     if new_priority != t["priority"]: changed.append(f"priority changed to {new_priority}")
                     if new_assignee_id != t["assignee_id"]: changed.append("assignee updated")
                     resolved_at = now() if new_status in ["Resolved", "Closed"] else None
-                    execute(
-                        """UPDATE tickets SET status=?, priority=?, team=?, assignee_id=?, updated_at=?,
-                           resolved_at=CASE WHEN ? IS NOT NULL THEN ? WHEN ? IN ('Open','Assigned','In Progress','On Hold') THEN NULL ELSE resolved_at END
-                           WHERE id=? AND company_id=?""",
-                        (new_status, new_priority, new_team, new_assignee_id, now(),
-                         resolved_at, resolved_at, new_status, ticket_id, company_id)
-                    )
+                    with db() as con:
+                        update_cursor = con.execute(
+                            """UPDATE tickets SET status=?, priority=?, team=?, assignee_id=?, updated_at=?,
+                               resolved_at=CASE WHEN ? IS NOT NULL THEN ? WHEN ? IN ('Open','Assigned','In Progress','On Hold') THEN NULL ELSE resolved_at END
+                               WHERE id=? AND company_id=? AND status <> 'Closed'""",
+                            (new_status, new_priority, new_team, new_assignee_id, now(),
+                             resolved_at, resolved_at, new_status, ticket_id, company_id)
+                        )
+                        con.commit()
+                        updated_rows = update_cursor.rowcount
+                    if updated_rows == 0:
+                        st.error("This ticket has already been closed. Create a new ticket for any further work.")
+                        st.stop()
                     if changed:
                         action = f"{user['full_name']} " + ", ".join(changed)
                         add_activity(ticket_id, user["id"], action)
@@ -1534,8 +1631,10 @@ elif page == "Notifications":
     notifs = q_all(
         """SELECT n.*, t.ticket_key FROM notifications n
            LEFT JOIN tickets t ON t.id=n.ticket_id
-           WHERE n.user_id=? AND n.company_id=? ORDER BY n.created_at DESC LIMIT 100""",
-        (user["id"], company_id)
+           WHERE n.user_id=? AND n.company_id=?
+             AND (n.ticket_id IS NULL OR t.id IS NULL OR t.team=? OR t.assignee_id=?)
+           ORDER BY n.created_at DESC LIMIT 100""",
+        (user["id"], company_id, user["team"], user["id"])
     )
     top1, top2 = st.columns([1, 4])
     if top1.button("Mark all as read"):
