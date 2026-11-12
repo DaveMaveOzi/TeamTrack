@@ -1,21 +1,25 @@
-TEAMTRACK BRANDING UPDATE
+TEAMTRACK — LANDING PAGE UPDATE
 
-Files included:
-- main.py: updated TeamTrack application source
-- teamtrack_logo.png: transparent TeamTrack logo asset
-- requirements.txt: Python dependencies
+This package continues from TeamTrack_Role_Permissions_Update.zip.
 
-INSTALLATION
-1. Make a backup copy of your existing project folder.
-2. Extract these files into the existing TeamTrack project folder.
-3. Replace the existing main.py and teamtrack_logo.png when prompted.
-4. Keep your existing teamtrack.db, uploads folder, and any .env or secrets files. Do not delete or replace them.
-5. Run the app locally to verify it, then commit and push the updated files to GitHub.
+Files:
+- main.py: Existing TeamTrack application with the new public landing page.
+- teamtrack_logo.png: Existing TeamTrack brand logo.
+- landing_illustration.png: Illustration cropped from the supplied landing-page design.
+- requirements.txt: Existing application dependencies.
 
-Branding changes in this update:
-- Authentication pages: compact transparent logo at the top-left.
-- Authentication pages: written TeamTrack wordmark centred above the Sign in / Create company / Join company card.
-- Authenticated workspace: compact transparent logo at the top of the sidebar, replacing the text wordmark.
-- Logo display width: 40 px, preserving its aspect ratio.
+Landing page behaviour:
+- Get Started opens the existing Create Company registration view.
+- Sign In opens the existing Sign In view.
+- Existing Join Company access remains available from the authentication view.
+- Existing authenticated workspace and features are retained.
 
-The Python source passed a syntax compilation check. The app has not been browser-tested in this environment.
+The landing page follows the supplied reference composition, with TeamTrack branding in the footer.
+Company email-domain restrictions are not enabled; ordinary email addresses remain accepted for testing.
+
+Run locally:
+  pip install -r requirements.txt
+  streamlit run main.py
+
+Before production use, validate authentication, role permissions, tenant isolation, persistent storage,
+email delivery and deployment configuration with test accounts and test data.

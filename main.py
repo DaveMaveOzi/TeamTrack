@@ -5,6 +5,7 @@ import sqlite3
 import smtplib
 import io
 import csv
+import base64
 import html
 from email.message import EmailMessage
 from datetime import datetime, timezone, date, timedelta
@@ -33,7 +34,7 @@ LOGO_PATH = APP_DIR / "teamtrack_logo.png"
 
 STATUSES = ["Open", "Assigned", "In Progress", "On Hold", "Resolved", "Closed"]
 PRIORITIES = ["Critical", "High", "Medium", "Low"]
-ROLES = ["Admin", "Team Lead", "Member", "Viewer"]
+ROLES = ["Admin", "IT Personnel", "Team Lead", "Member", "Viewer"]
 DEFAULT_TEAMS = ["IT", "HR", "Marketing", "Operations", "Finance", "Customer Support", "Product", "Design"]
 
 st.set_page_config(
@@ -500,12 +501,30 @@ def logout():
 # -----------------------------
 # APP HELPERS
 # -----------------------------
-def can_manage(user):
-    return user["role"] in ["Admin", "Team Lead"]
-
-
 def is_admin(user):
     return user["role"] == "Admin"
+
+
+def is_it(user):
+    return user["role"] == "IT Personnel"
+
+
+def can_assign_across_departments(user):
+    return is_admin(user) or is_it(user)
+
+
+def can_assign_in_department(user, department):
+    if can_assign_across_departments(user):
+        return True
+    return user["role"] == "Team Lead" and user["team"] == department
+
+
+def can_manage(user):
+    return is_admin(user) or is_it(user) or user["role"] == "Team Lead"
+
+
+def can_manage_members(user):
+    return is_admin(user)
 
 
 def ticket_key(company_id):
@@ -698,6 +717,83 @@ if "user" not in st.session_state:
     st.session_state.user = None
 
 if not st.session_state.user:
+    if "teamtrack_public_page" not in st.session_state:
+        st.session_state.teamtrack_public_page = "landing"
+    if "teamtrack_auth_mode" not in st.session_state:
+        st.session_state.teamtrack_auth_mode = "signin"
+
+    # Public landing page, replicated from the supplied TeamTrack design.
+    if st.session_state.teamtrack_public_page == "landing":
+        st.markdown("""
+        <style>
+        [data-testid="stSidebar"] {display:none !important;}
+        [data-testid="stHeader"] {display:none !important;}
+        [data-testid="stMainBlockContainer"] {max-width:1440px !important; padding:0 0 76px !important;}
+        [data-testid="stAppViewContainer"], .stApp, [data-testid="stMain"] {background:#FFFFFF !important;}
+        .tt-landing-top {height:90px; display:flex; align-items:center; padding-left:32px; border-bottom:1px solid #E7DDE1; box-sizing:border-box;}
+        .tt-landing-copy {text-align:center; padding:76px 20px 0; color:#080808;}
+        .tt-landing-title {font-size:35px; line-height:1.48; font-weight:700; letter-spacing:-1.45px; margin:0 auto 10px; color:#080808; max-width:850px;}
+        .tt-landing-subtitle {font-size:16px; line-height:1.55; color:#777174; margin:0 auto; max-width:720px; font-weight:400;}
+        .st-key-landing_get_started, .st-key-landing_sign_in {margin-top:24px !important;}
+        .tt-landing-illustration {display:flex; justify-content:center; margin:34px auto 0; width:100%;}
+        .tt-landing-illustration img {width:min(470px, 82vw); height:auto; object-fit:contain;}
+        .tt-landing-footer-wrap {position:fixed; z-index:999; left:0; right:0; bottom:0; display:flex; justify-content:center; align-items:center; gap:14px; padding:15px 18px 17px; background:rgba(255,255,255,.97); border-top:1px solid #F0EAED; box-sizing:border-box;}
+        .tt-landing-footer {text-align:center; color:#777174; font-size:11px; margin:0;}
+        .tt-landing-legal {display:flex; align-items:center; gap:14px; font-size:11px; color:#4D0F28;}
+        .tt-landing-legal span {display:inline-block; color:#4D0F28; padding:0; margin:0;}
+        .st-key-landing_get_started button {background:#4D0F28 !important; border:1px solid #4D0F28 !important; color:#FFFFFF !important; border-radius:22px !important; min-height:48px !important; font-size:17px !important; font-weight:500 !important;}
+        .st-key-landing_get_started button p {color:#FFFFFF !important;}
+        .st-key-landing_sign_in button {background:#FFFFFF !important; border:1px solid #4D0F28 !important; color:#4D0F28 !important; border-radius:22px !important; min-height:48px !important; font-size:17px !important; font-weight:500 !important;}
+        .st-key-landing_sign_in button p {color:#4D0F28 !important;}
+        @media(max-width:700px) {
+          .tt-landing-top {height:72px; padding-left:18px;}
+          .tt-landing-copy {padding:54px 18px 0;}
+          .tt-landing-title {font-size:26px; line-height:1.35; letter-spacing:-.8px;}
+          .tt-landing-subtitle {font-size:14px;}
+          .st-key-landing_get_started, .st-key-landing_sign_in {margin-top:20px !important;}
+          .tt-landing-illustration {margin-top:28px;}
+          .tt-landing-illustration img {width:min(390px, 88vw);}
+          .tt-landing-footer-wrap {gap:10px; flex-wrap:wrap; padding:11px 12px 13px;}
+          .tt-landing-footer, .tt-landing-legal {font-size:10px;}
+          [data-testid="stMainBlockContainer"] {padding:0 0 76px !important;}
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
+        if LOGO_PATH.exists():
+            logo_data = base64.b64encode(LOGO_PATH.read_bytes()).decode("ascii")
+            logo_markup = f"<img src='data:image/png;base64,{logo_data}' alt='TeamTrack' style='width:54px;height:auto;display:block'>"
+        else:
+            logo_markup = "<strong style='color:#4D0F28'>TeamTrack</strong>"
+        st.markdown(f"<div class='tt-landing-top'>{logo_markup}</div>", unsafe_allow_html=True)
+        st.markdown("""
+        <div class='tt-landing-copy'>
+          <div class='tt-landing-title'>Every task has a place.<br>Every team has a clear direction.</div>
+          <div class='tt-landing-subtitle'>From raising requests to tracking resolutions,<br>TeamTrack helps teams stay organised, connected and accountable.</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        button_spacer_l, button_area, button_spacer_r = st.columns([1.45, 1.65, 1.45])
+        with button_area:
+            start_col, signin_col = st.columns(2, gap="large")
+            with start_col:
+                if st.button("Get Started", key="landing_get_started", type="primary", use_container_width=True):
+                    st.session_state.teamtrack_auth_mode = "create"
+                    st.session_state.teamtrack_public_page = "auth"
+                    st.rerun()
+            with signin_col:
+                if st.button("Sign In", key="landing_sign_in", use_container_width=True):
+                    st.session_state.teamtrack_auth_mode = "signin"
+                    st.session_state.teamtrack_public_page = "auth"
+                    st.rerun()
+
+        illustration_path = APP_DIR / "landing_illustration.png"
+        if illustration_path.exists():
+            illustration_data = base64.b64encode(illustration_path.read_bytes()).decode("ascii")
+            st.markdown(f"<div class='tt-landing-illustration'><img src='data:image/png;base64,{illustration_data}' alt='A team member organising work at a desk'></div>", unsafe_allow_html=True)
+        st.markdown("<div class='tt-landing-footer-wrap'><div class='tt-landing-footer'>© 2026 TeamTrack. All rights reserved.</div><div class='tt-landing-legal'><span>Terms</span><span>Privacy</span></div></div>", unsafe_allow_html=True)
+        st.stop()
+
     # Keep the authentication experience visually consistent with the
     # Envoyce-inspired VENTICK interface: centred wordmark, compact white
     # card, clear segmented navigation, generous spacing and Poppins.
@@ -759,10 +855,7 @@ if not st.session_state.user:
     with centre:
         st.markdown("<div class='teamtrack-auth-page-wordmark'>TeamTrack</div>", unsafe_allow_html=True)
         with st.container(border=True, key="teamtrack_auth_card"):
-            if "teamtrack_auth_mode" not in st.session_state:
-                st.session_state.teamtrack_auth_mode = "signin"
-
-            mode = st.session_state.teamtrack_auth_mode
+            mode = st.session_state.get("teamtrack_auth_mode", "signin")
             nav1, nav2, nav3 = st.columns(3, gap="small")
             with nav1:
                 if st.button("Sign in", key="auth_nav_signin", use_container_width=True,
@@ -896,6 +989,8 @@ teams = [r["name"] for r in q_all("SELECT name FROM teams WHERE company_id=? ORD
 if not teams:
     teams = DEFAULT_TEAMS
 all_tickets = ticket_rows(user)
+if user["role"] == "Team Lead":
+    all_tickets = [ticket for ticket in all_tickets if ticket["team"] == user["team"]]
 unread = q_one("SELECT COUNT(*) AS n FROM notifications WHERE user_id=? AND is_read=0", (user["id"],))["n"]
 
 # Show the new workspace invitation code once the first Admin has created
@@ -926,7 +1021,9 @@ with st.sidebar:
         st.session_state.teamtrack_theme = selected_theme
         st.rerun()
     st.markdown("---")
-    pages = ["Overview", "All tickets", "My tickets", "Create ticket", "Notifications"]
+    pages = ["Overview", "All tickets", "My tickets", "Notifications"]
+    if user["role"] != "Viewer":
+        pages.insert(3, "Create ticket")
     if can_manage(user):
         pages += ["Team & members", "Reports"]
     if is_admin(user):
@@ -1001,8 +1098,14 @@ elif page == "Create ticket":
         col3, col4 = st.columns(2)
         priority = col3.selectbox("Priority", PRIORITIES, index=2)
         due_date = col4.date_input("Due date (optional)", value=None)
-        assignee_options = ["Unassigned"] + [f"{m['full_name']} ({m['team']})" for m in members if m["team"] == team]
-        assignee_choice = st.selectbox("Assign to (optional)", assignee_options)
+        can_assign_here = can_assign_in_department(user, team)
+        if can_assign_here:
+            assignable_members = [m for m in members if m["team"] == team]
+            assignee_options = ["Unassigned"] + [f"{m['full_name']} ({m['team']})" for m in assignable_members]
+            assignee_choice = st.selectbox("Assign to (optional)", assignee_options)
+        else:
+            assignee_choice = "Unassigned"
+            st.caption("A Team Lead, IT Personnel member or Company Admin will assign this ticket.")
         attachment = st.file_uploader("Attachment (optional)", type=["png", "jpg", "jpeg", "pdf", "txt", "doc", "docx", "xlsx", "csv"])
         submitted = st.form_submit_button("Submit ticket", type="primary", use_container_width=True)
     if submitted:
@@ -1012,9 +1115,9 @@ elif page == "Create ticket":
             ticket_id = str(uuid.uuid4())
             key = ticket_key(company_id)
             assignee_id = None
-            if assignee_choice != "Unassigned":
-                assignee_name = assignee_choice.split(" (")[0]
-                found = next((m for m in members if m["full_name"] == assignee_name), None)
+            if assignee_choice != "Unassigned" and can_assign_in_department(user, team):
+                assignee_name = assignee_choice.rsplit(" (", 1)[0]
+                found = next((m for m in members if m["full_name"] == assignee_name and m["team"] == team), None)
                 assignee_id = found["id"] if found else None
             status = "Assigned" if assignee_id else "Open"
             due = due_date.isoformat() if due_date else None
@@ -1114,9 +1217,14 @@ elif page == "Ticket details":
                     st.markdown(f"**{comment['full_name']}**")
                     st.write(comment["body"])
                     st.caption(comment["created_at"][:16].replace("T", " "))
-            with st.form("comment_form"):
-                comment_body = st.text_area("Add a comment or progress update")
-                submitted = st.form_submit_button("Post comment", type="primary")
+            submitted = False
+            comment_body = ""
+            if user["role"] != "Viewer":
+                with st.form("comment_form"):
+                    comment_body = st.text_area("Add a comment or progress update")
+                    submitted = st.form_submit_button("Post comment", type="primary")
+            else:
+                st.caption("Viewer access is read-only.")
             if submitted:
                 if comment_body.strip():
                     execute(
@@ -1140,24 +1248,41 @@ elif page == "Ticket details":
             st.write(f"**Created:** {t['created_at'][:10]}")
             st.write(f"**Due:** {t['due_date'] or 'Not set'}")
             st.markdown("---")
-            can_edit = (user["role"] in ["Admin", "Team Lead"] or
-                        user["id"] in [t["reporter_id"], t["assignee_id"]])
-            if can_edit:
+            team_lead_can_access = user["role"] == "Team Lead" and user["team"] == t["team"]
+            if user["role"] == "Team Lead" and not team_lead_can_access:
+                st.error("You can only access tickets belonging to your department.")
+                st.stop()
+            can_update_work = (user["role"] in ["Admin", "IT Personnel"] or team_lead_can_access or
+                               (user["role"] != "Viewer" and user["id"] in [t["reporter_id"], t["assignee_id"]]))
+            can_reassign = can_assign_in_department(user, t["team"])
+            if can_update_work:
                 with st.form("ticket_update_form"):
                     new_status = st.selectbox("Status", STATUSES, index=STATUSES.index(t["status"]))
                     new_priority = st.selectbox("Priority", PRIORITIES, index=PRIORITIES.index(t["priority"]))
-                    new_team = st.selectbox("Team", teams, index=teams.index(t["team"]) if t["team"] in teams else 0)
-                    assignable = [m for m in members if m["team"] == new_team]
-                    assign_labels = ["Unassigned"] + [f"{m['full_name']} ({m['team']})" for m in assignable]
-                    current_assignee = next((f"{m['full_name']} ({m['team']})" for m in assignable if m["id"] == t["assignee_id"]), "Unassigned")
-                    new_assignee_label = st.selectbox("Assignee", assign_labels,
-                        index=assign_labels.index(current_assignee) if current_assignee in assign_labels else 0)
+                    if can_reassign:
+                        if can_assign_across_departments(user):
+                            permitted_teams = teams
+                        else:
+                            permitted_teams = [user["team"]]
+                        team_index = permitted_teams.index(t["team"]) if t["team"] in permitted_teams else 0
+                        new_team = st.selectbox("Department", permitted_teams, index=team_index)
+                        assignable = [m for m in members if m["team"] == new_team]
+                        assign_labels = ["Unassigned"] + [f"{m['full_name']} ({m['team']})" for m in assignable]
+                        current_assignee = next((f"{m['full_name']} ({m['team']})" for m in assignable if m["id"] == t["assignee_id"]), "Unassigned")
+                        new_assignee_label = st.selectbox("Assignee", assign_labels,
+                            index=assign_labels.index(current_assignee) if current_assignee in assign_labels else 0)
+                    else:
+                        new_team = t["team"]
+                        new_assignee_label = None
+                        st.caption("Only Company Admins, IT Personnel and the relevant Department Team Lead can assign or reassign this ticket.")
                     update = st.form_submit_button("Save changes", type="primary", use_container_width=True)
                 if update:
-                    new_assignee_id = None
-                    if new_assignee_label != "Unassigned":
-                        new_assignee_name = new_assignee_label.split(" (")[0]
-                        new_assignee_id = next((m["id"] for m in assignable if m["full_name"] == new_assignee_name), None)
+                    new_assignee_id = t["assignee_id"]
+                    if can_reassign and new_assignee_label is not None:
+                        new_assignee_id = None
+                        if new_assignee_label != "Unassigned":
+                            new_assignee_name = new_assignee_label.rsplit(" (", 1)[0]
+                            new_assignee_id = next((m["id"] for m in assignable if m["full_name"] == new_assignee_name and m["team"] == new_team), None)
                     changed = []
                     if new_status != t["status"]: changed.append(f"status changed to {new_status}")
                     if new_priority != t["priority"]: changed.append(f"priority changed to {new_priority}")
@@ -1242,6 +1367,30 @@ elif page == "Team & members":
             a.caption(m["email"])
             b.write(m["team"])
             c.write(m["role"])
+    if is_admin(user):
+        st.markdown("### Manage employee roles")
+        st.caption("Assign IT Personnel and Department Team Lead permissions. Team Leads should belong to the department they lead.")
+        role_candidates = [m for m in members if m["id"] != user["id"]]
+        if role_candidates:
+            member_labels = {f"{m['full_name']} · {m['email']} · {m['team']}": m for m in role_candidates}
+            selected_label = st.selectbox("Employee", list(member_labels.keys()), key="role_employee_select")
+            selected_member = member_labels[selected_label]
+            role_col, dept_col = st.columns(2)
+            current_role = selected_member["role"] if selected_member["role"] in ROLES else "Member"
+            new_role = role_col.selectbox("Role", ROLES, index=ROLES.index(current_role), key="role_value_select")
+            new_department = dept_col.selectbox("Department", teams,
+                index=teams.index(selected_member["team"]) if selected_member["team"] in teams else 0,
+                key="role_department_select")
+            if st.button("Save employee access", type="primary", key="save_employee_access"):
+                if selected_member["id"] == user["id"]:
+                    st.error("You cannot change your own administrator access here.")
+                else:
+                    execute("UPDATE users SET role=?, team=? WHERE id=? AND company_id=?",
+                            (new_role, new_department, selected_member["id"], company_id))
+                    st.success(f"Updated {selected_member['full_name']}'s role and department.")
+                    st.rerun()
+        else:
+            st.info("Invite employees before managing their roles.")
     st.markdown("### Departments")
     for team_name in teams:
         st.write("• " + team_name)
