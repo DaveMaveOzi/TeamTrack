@@ -323,6 +323,15 @@ def init_db():
             UNIQUE(company_id, name),
             FOREIGN KEY(company_id) REFERENCES companies(id)
         );
+        CREATE TABLE IF NOT EXISTS password_reset_tokens (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            expires_at TEXT NOT NULL,
+            used_at TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
         """)
         con.commit()
 
@@ -357,13 +366,28 @@ def verify_password(password, hashed):
 # -----------------------------
 # NOTIFICATIONS
 # -----------------------------
+def _setting(name, default=""):
+    """Read deployment secrets first, then local environment variables."""
+    try:
+        value = st.secrets.get(name, None)
+        if value not in (None, ""):
+            return str(value)
+    except Exception:
+        pass
+    return os.getenv(name, default)
+
+
+def app_base_url():
+    return _setting("TEAMTRACK_APP_URL", "https://teamtrack.streamlit.app/").rstrip("/")
+
+
 def send_email(to_email, subject, body):
-    """Email is sent only when SMTP environment variables are configured."""
-    host = os.getenv("TEAMTRACK_SMTP_HOST")
-    port = int(os.getenv("TEAMTRACK_SMTP_PORT", "587"))
-    username = os.getenv("TEAMTRACK_SMTP_USERNAME")
-    password = os.getenv("TEAMTRACK_SMTP_PASSWORD")
-    sender = os.getenv("TEAMTRACK_FROM_EMAIL", username or "")
+    """Send email when SMTP credentials are configured in secrets or environment."""
+    host = _setting("TEAMTRACK_SMTP_HOST")
+    port = int(_setting("TEAMTRACK_SMTP_PORT", "587"))
+    username = _setting("TEAMTRACK_SMTP_USERNAME")
+    password = _setting("TEAMTRACK_SMTP_PASSWORD")
+    sender = _setting("TEAMTRACK_FROM_EMAIL", username or "")
     if not all([host, username, password, sender, to_email]):
         return False
     msg = EmailMessage()
@@ -379,6 +403,76 @@ def send_email(to_email, subject, body):
         return True
     except Exception:
         return False
+
+
+def send_registration_emails(company_id, user_id, is_company_admin=False):
+    """Send registration confirmation to the new user and notify the company contact."""
+    user = q_one("SELECT full_name, email, team FROM users WHERE id=? AND company_id=?", (user_id, company_id))
+    company = q_one("SELECT name FROM companies WHERE id=?", (company_id,))
+    if not user or not company:
+        return {"user": False, "company": False}
+    user_sent = send_email(
+        user["email"],
+        "Your TeamTrack registration is confirmed",
+        f"Hello {user['full_name']},\n\nYour TeamTrack account for {company['name']} has been created. "
+        "You can now sign in to your workspace.\n\nTeamTrack"
+    )
+    if is_company_admin:
+        # The company registration contact is the first Admin's registered email.
+        company_sent = user_sent
+    else:
+        admin = q_one("SELECT email, full_name FROM users WHERE company_id=? AND role='Admin' AND active=1 ORDER BY created_at LIMIT 1", (company_id,))
+        company_sent = False
+        if admin:
+            company_sent = send_email(
+                admin["email"],
+                f"New TeamTrack registration — {company['name']}",
+                f"Hello {admin['full_name']},\n\n{user['full_name']} ({user['email']}) has registered in "
+                f"the {company['name']} workspace for the {user['team']} department.\n\nTeamTrack"
+            )
+    return {"user": user_sent, "company": company_sent}
+
+
+def create_password_reset(user_email, company_code=""):
+    sql = "SELECT u.id, u.full_name, u.email, c.name AS company_name, c.join_code FROM users u JOIN companies c ON c.id=u.company_id WHERE lower(u.email)=lower(?) AND u.active=1"
+    params = [user_email.strip().lower()]
+    if company_code.strip():
+        sql += " AND upper(c.join_code)=upper(?)"
+        params.append(company_code.strip())
+    matches = q_all(sql, tuple(params))
+    # Avoid exposing whether an email is registered.
+    if len(matches) != 1:
+        return False
+    user = matches[0]
+    raw_token = uuid.uuid4().hex + uuid.uuid4().hex
+    token_hash = __import__("hashlib").sha256(raw_token.encode()).hexdigest()
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=45)).isoformat(timespec="seconds")
+    execute(
+        "INSERT INTO password_reset_tokens (id,user_id,token_hash,expires_at,created_at) VALUES (?,?,?,?,?)",
+        (str(uuid.uuid4()), user["id"], token_hash, expires, now())
+    )
+    reset_link = f"{app_base_url()}/?reset={raw_token}"
+    sent = send_email(
+        user["email"], "Reset your TeamTrack password",
+        f"Hello {user['full_name']},\n\nUse the link below to choose a new password. This link expires in 45 minutes and can only be used once.\n\n{reset_link}\n\nIf you did not request this, you can ignore this email.\n\nTeamTrack"
+    )
+    return sent
+
+
+def complete_password_reset(raw_token, new_password):
+    token_hash = __import__("hashlib").sha256(raw_token.encode()).hexdigest()
+    record = q_one(
+        "SELECT id,user_id,expires_at,used_at FROM password_reset_tokens WHERE token_hash=?",
+        (token_hash,)
+    )
+    if not record or record["used_at"] or record["expires_at"] < now():
+        return False
+    with db() as con:
+        con.execute("UPDATE users SET password_hash=? WHERE id=?", (password_hash(new_password), record["user_id"]))
+        con.execute("UPDATE password_reset_tokens SET used_at=? WHERE id=?", (now(), record["id"]))
+        con.execute("UPDATE password_reset_tokens SET used_at=? WHERE user_id=? AND id<>? AND used_at IS NULL", (now(), record["user_id"], record["id"]))
+        con.commit()
+    return True
 
 
 def notify_users(company_id, user_ids, ticket_id, message, subject="TeamTrack update"):
@@ -454,7 +548,8 @@ def create_company(company_name, full_name, email, password, team):
                 con.execute("INSERT OR IGNORE INTO teams (id, company_id, name) VALUES (?, ?, ?)",
                             (str(uuid.uuid4()), company_id, name))
             con.commit()
-        return True, (company_id, user_id, join_code)
+        email_status = send_registration_emails(company_id, user_id, is_company_admin=True)
+        return True, (company_id, user_id, join_code, email_status)
     except sqlite3.IntegrityError:
         return False, "This email is already registered in that workspace."
 
@@ -472,7 +567,8 @@ def join_company(join_code, full_name, email, password, team):
             (user_id, company["id"], full_name.strip(), email.strip().lower(),
              password_hash(password), team, now())
         )
-        return True, (company["id"], user_id, company["name"])
+        email_status = send_registration_emails(company["id"], user_id, is_company_admin=False)
+        return True, (company["id"], user_id, company["name"], email_status)
     except sqlite3.IntegrityError:
         return False, "This email is already registered in that company."
 
@@ -716,6 +812,30 @@ init_db()
 if "user" not in st.session_state:
     st.session_state.user = None
 
+# A password-reset link opens a dedicated form before the normal sign-in view.
+reset_token = st.query_params.get("reset", "")
+if reset_token and not st.session_state.user:
+    st.markdown("<div style='max-width:460px;margin:8vh auto 0;text-align:center'><h2>Choose a new password</h2><p>Use at least 8 characters.</p></div>", unsafe_allow_html=True)
+    with st.container(border=True):
+        with st.form("complete_password_reset_form"):
+            new_password = st.text_input("New password", type="password")
+            confirm_new_password = st.text_input("Confirm new password", type="password")
+            reset_submit = st.form_submit_button("Update password", type="primary", use_container_width=True)
+        if reset_submit:
+            if len(new_password) < 8:
+                st.error("Use a password with at least 8 characters.")
+            elif new_password != confirm_new_password:
+                st.error("The passwords do not match.")
+            elif complete_password_reset(reset_token, new_password):
+                st.query_params.clear()
+                st.session_state.teamtrack_password_reset_success = True
+                st.session_state.teamtrack_public_page = "auth"
+                st.session_state.teamtrack_auth_mode = "signin"
+                st.rerun()
+            else:
+                st.error("This reset link is invalid, expired or has already been used. Request a new link.")
+    st.stop()
+
 if not st.session_state.user:
     if "teamtrack_public_page" not in st.session_state:
         st.session_state.teamtrack_public_page = "landing"
@@ -728,7 +848,7 @@ if not st.session_state.user:
         <style>
         [data-testid="stSidebar"] {display:none !important;}
         [data-testid="stHeader"] {display:none !important;}
-        [data-testid="stMainBlockContainer"] {max-width:1440px !important; padding:0 0 76px !important;}
+        [data-testid="stMainBlockContainer"] {max-width:1440px !important; min-height:100vh !important; padding:0 0 76px !important; box-sizing:border-box !important;}
         [data-testid="stAppViewContainer"], .stApp, [data-testid="stMain"] {background:#FFFFFF !important;}
         .tt-landing-top {height:90px; display:flex; align-items:center; padding-left:32px; border-bottom:1px solid #E7DDE1; box-sizing:border-box;}
         .tt-landing-copy {text-align:center; padding:76px 20px 0; color:#080808;}
@@ -737,7 +857,13 @@ if not st.session_state.user:
         .st-key-landing_get_started, .st-key-landing_sign_in {margin-top:24px !important;}
         .tt-landing-illustration {display:flex; justify-content:center; margin:34px auto 0; width:100%;}
         .tt-landing-illustration img {width:min(470px, 82vw); height:auto; object-fit:contain;}
-        .tt-landing-footer-wrap {position:fixed; z-index:999; left:0; right:0; bottom:0; display:flex; justify-content:center; align-items:center; gap:14px; padding:15px 18px 17px; background:rgba(255,255,255,.97); border-top:1px solid #F0EAED; box-sizing:border-box;}
+        .tt-social-proof {display:flex; justify-content:center; align-items:center; gap:12px; margin:24px auto 34px; color:#A19A9E; font-size:13px; font-weight:400;}
+        .tt-social-avatars {display:flex; align-items:center; padding-left:4px;}
+        .tt-social-avatar {width:30px; height:30px; border-radius:50%; display:block; overflow:hidden; border:2px solid #fff; margin-left:-6px; background:#F0DDE5; box-shadow:0 1px 3px rgba(40,20,28,.12);}
+        .tt-social-avatar img {width:100%; height:100%; display:block; object-fit:cover;}
+        .tt-social-avatar:nth-child(2) {background:#E8D9CE;}
+        .tt-social-avatar:nth-child(3) {background:#D8E4E1;}
+        .tt-landing-footer-wrap {position:fixed; z-index:1000; left:0; right:0; bottom:0; width:100%; min-height:58px; display:flex; justify-content:center; align-items:center; gap:14px; padding:14px 18px 16px; margin:0; background:#FFFFFF; border-top:1px solid #F0EAED; box-sizing:border-box;}
         .tt-landing-footer {text-align:center; color:#777174; font-size:11px; margin:0;}
         .tt-landing-legal {display:flex; align-items:center; gap:14px; font-size:11px; color:#4D0F28;}
         .tt-landing-legal span {display:inline-block; color:#4D0F28; padding:0; margin:0;}
@@ -751,11 +877,13 @@ if not st.session_state.user:
           .tt-landing-title {font-size:26px; line-height:1.35; letter-spacing:-.8px;}
           .tt-landing-subtitle {font-size:14px;}
           .st-key-landing_get_started, .st-key-landing_sign_in {margin-top:20px !important;}
-          .tt-landing-illustration {margin-top:28px;}
+          .tt-landing-illustration {margin-top:32px;}
           .tt-landing-illustration img {width:min(390px, 88vw);}
-          .tt-landing-footer-wrap {gap:10px; flex-wrap:wrap; padding:11px 12px 13px;}
+          .tt-social-proof {margin:20px auto 28px; font-size:12px; gap:9px;}
+          .tt-social-avatar {width:27px; height:27px;}
+          .tt-landing-footer-wrap {gap:10px; flex-wrap:wrap; padding:12px 12px 14px; min-height:58px;}
           .tt-landing-footer, .tt-landing-legal {font-size:10px;}
-          [data-testid="stMainBlockContainer"] {padding:0 0 76px !important;}
+          [data-testid="stMainBlockContainer"] {padding:0 0 12px !important;}
         }
         </style>
         """, unsafe_allow_html=True)
@@ -791,6 +919,22 @@ if not st.session_state.user:
         if illustration_path.exists():
             illustration_data = base64.b64encode(illustration_path.read_bytes()).decode("ascii")
             st.markdown(f"<div class='tt-landing-illustration'><img src='data:image/png;base64,{illustration_data}' alt='A team member organising work at a desk'></div>", unsafe_allow_html=True)
+        # Small illustrated profile portraits replace generic person symbols.
+        avatar_svgs = [
+            "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' fill='#E9D8DE'/><path d='M9 64c2-15 10-23 23-23s21 8 23 23' fill='#4D0F28'/><circle cx='32' cy='25' r='13' fill='#B97858'/><path d='M18 25c0-13 7-19 15-19 10 0 15 8 14 20-4-3-8-8-9-12-5 6-12 9-20 11' fill='#2D1B1B'/></svg>",
+            "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' fill='#E8E0D7'/><path d='M8 64c2-15 10-23 24-23s22 8 24 23' fill='#566B70'/><circle cx='32' cy='25' r='13' fill='#D59A72'/><path d='M18 23c1-12 7-18 15-18 9 0 14 7 14 18-5-2-10-6-13-11-4 6-9 9-16 11' fill='#38251E'/></svg>",
+            "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' fill='#DCE7E3'/><path d='M8 64c2-15 10-23 24-23s22 8 24 23' fill='#92718A'/><circle cx='32' cy='25' r='13' fill='#8D573F'/><path d='M17 27c-1-14 5-22 15-22s16 8 15 22l-4-2-2-11c-7 7-14 10-24 11' fill='#171616'/></svg>"
+        ]
+        avatar_markup = "".join(
+            "<span class='tt-social-avatar'><img alt='TeamTrack community member' src='data:image/svg+xml;base64," +
+            base64.b64encode(svg.encode('utf-8')).decode('ascii') + "'></span>"
+            for svg in avatar_svgs
+        )
+        st.markdown(
+            "<div class='tt-social-proof'><div class='tt-social-avatars'>" + avatar_markup +
+            "</div><span>Used by 200+ companies</span></div>",
+            unsafe_allow_html=True,
+        )
         st.markdown("<div class='tt-landing-footer-wrap'><div class='tt-landing-footer'>© 2026 TeamTrack. All rights reserved.</div><div class='tt-landing-legal'><span>Terms</span><span>Privacy</span></div></div>", unsafe_allow_html=True)
         st.stop()
 
@@ -896,6 +1040,33 @@ if not st.session_state.user:
                         st.rerun()
                     else:
                         st.error("We couldn't verify those login details. Check your email, password and company code.")
+                if st.button("Forgot password?", key="forgot_password_link"):
+                    st.session_state.teamtrack_auth_mode = "forgot"
+                    st.rerun()
+
+            elif mode == "forgot":
+                st.markdown("""
+                <div class="teamtrack-auth-heading">
+                  <h2>Reset your password</h2>
+                  <p>Enter your account email. If it is registered, we will send a reset link.</p>
+                </div>
+                """, unsafe_allow_html=True)
+                with st.form("forgot_password_form", clear_on_submit=False):
+                    reset_email = st.text_input("Account email", placeholder="you@company.com")
+                    reset_company_code = st.text_input("Company code (if needed)", placeholder="Optional")
+                    reset_submitted = st.form_submit_button("Send reset link", type="primary", use_container_width=True)
+                if reset_submitted:
+                    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", reset_email.strip()):
+                        st.error("Enter a valid email address.")
+                    else:
+                        sent = create_password_reset(reset_email, reset_company_code)
+                        if sent:
+                            st.success("If the account exists and email delivery is configured, a password reset link has been sent.")
+                        else:
+                            st.info("If the account exists and email delivery is configured, a password reset link will be sent. Check your email shortly.")
+                if st.button("Back to sign in", key="forgot_back_signin"):
+                    st.session_state.teamtrack_auth_mode = "signin"
+                    st.rerun()
 
             elif mode == "create":
                 st.markdown("""
@@ -924,8 +1095,9 @@ if not st.session_state.user:
                     else:
                         ok, result = create_company(company_name, owner_name, owner_email, owner_password, team)
                         if ok:
-                            company_id, user_id, code = result
+                            company_id, user_id, code, email_status = result
                             st.session_state.teamtrack_created_join_code = code
+                            st.session_state.teamtrack_registration_email_status = email_status
                             st.session_state.user = dict(q_one(
                                 """SELECT u.*, c.name AS company_name, c.join_code
                                    FROM users u JOIN companies c ON c.id=u.company_id WHERE u.id=?""",
@@ -963,7 +1135,8 @@ if not st.session_state.user:
                     else:
                         ok, result = join_company(join_code, full_name, join_email, join_password, join_team)
                         if ok:
-                            company_id, user_id, company_name = result
+                            company_id, user_id, company_name, email_status = result
+                            st.session_state.teamtrack_registration_email_status = email_status
                             st.session_state.user = dict(q_one(
                                 """SELECT u.*, c.name AS company_name, c.join_code
                                    FROM users u JOIN companies c ON c.id=u.company_id WHERE u.id=?""",
@@ -974,6 +1147,16 @@ if not st.session_state.user:
                         else:
                             st.error(result)
 
+        if st.session_state.pop("teamtrack_password_reset_success", False):
+            st.success("Your password has been updated. You can now sign in.")
+        email_status = st.session_state.pop("teamtrack_registration_email_status", None)
+        if email_status is not None:
+            if email_status.get("user"):
+                st.success("Registration confirmation email sent.")
+            else:
+                st.warning("Your account was created, but confirmation email delivery is not configured or could not be completed. Set the SMTP secrets to enable email.")
+            if not email_status.get("company", False) and st.session_state.get("teamtrack_auth_mode") == "join":
+                st.info("The company notification could not be sent. Check the SMTP configuration.")
         st.markdown("<div class='teamtrack-auth-foot'>TeamTrack · Your team's work, in one place.</div>", unsafe_allow_html=True)
     st.stop()
 
@@ -986,6 +1169,14 @@ company_id = user["company_id"]
 company_name = user["company_name"]
 members = get_company_users(company_id)
 teams = [r["name"] for r in q_all("SELECT name FROM teams WHERE company_id=? ORDER BY name", (company_id,))]
+registration_email_status = st.session_state.pop("teamtrack_registration_email_status", None)
+if registration_email_status is not None:
+    if registration_email_status.get("user"):
+        st.success("Registration confirmation email sent.")
+    else:
+        st.warning("Your account was created, but email delivery is not configured or could not be completed. Configure the SMTP secrets to enable confirmation emails.")
+    if not registration_email_status.get("company", False) and user.get("role") != "Admin":
+        st.info("The company notification email could not be sent. Check the SMTP configuration.")
 if not teams:
     teams = DEFAULT_TEAMS
 all_tickets = ticket_rows(user)
@@ -1392,8 +1583,92 @@ elif page == "Team & members":
         else:
             st.info("Invite employees before managing their roles.")
     st.markdown("### Departments")
+    if not DARK_MODE:
+        st.markdown("""
+        <style>
+        /* Light-mode department removal controls: burgundy surface, white label. */
+        [data-testid="stPopover"] > button,
+        [data-testid="stPopover"] > div > button {
+            background:#4D0F28 !important;
+            border:1px solid #4D0F28 !important;
+            color:#FFFFFF !important;
+            border-radius:8px !important;
+        }
+        [data-testid="stPopover"] > button p,
+        [data-testid="stPopover"] > button span,
+        [data-testid="stPopover"] > div > button p,
+        [data-testid="stPopover"] > div > button span {
+            color:#FFFFFF !important;
+        }
+        [data-testid="stPopover"] > button:hover,
+        [data-testid="stPopover"] > div > button:hover {
+            background:#681B39 !important;
+            border-color:#681B39 !important;
+            color:#FFFFFF !important;
+        }
+        /* Scope the confirmation panel using a marker rendered inside this
+           specific popover. Streamlit places popover content in a portal. */
+        [data-baseweb="popover"]:has(.tt-remove-dept-marker),
+        [data-baseweb="popover"]:has(.tt-remove-dept-marker) > div,
+        [data-baseweb="popover"]:has(.tt-remove-dept-marker) [data-testid="stPopoverBody"] {
+            background:#4D0F28 !important;
+            border-color:#4D0F28 !important;
+            color:#FFFFFF !important;
+        }
+        [data-baseweb="popover"]:has(.tt-remove-dept-marker) *,
+        [data-baseweb="popover"]:has(.tt-remove-dept-marker) *::before,
+        [data-baseweb="popover"]:has(.tt-remove-dept-marker) *::after {
+            color:#FFFFFF !important;
+        }
+        [data-baseweb="popover"]:has(.tt-remove-dept-marker) [data-testid="stCheckbox"] svg {
+            color:#FFFFFF !important;
+            fill:#FFFFFF !important;
+        }
+        [data-baseweb="popover"]:has(.tt-remove-dept-marker) button[kind="primary"] {
+            background:#FFFFFF !important;
+            border-color:#FFFFFF !important;
+            color:#4D0F28 !important;
+        }
+        [data-baseweb="popover"]:has(.tt-remove-dept-marker) button[kind="primary"] *,
+        [data-baseweb="popover"]:has(.tt-remove-dept-marker) button[kind="primary"] svg {
+            color:#4D0F28 !important;
+            fill:#4D0F28 !important;
+        }
+        </style>
+        """, unsafe_allow_html=True)
     for team_name in teams:
-        st.write("• " + team_name)
+        dept_col, action_col = st.columns([4, 1.4])
+        dept_col.write("• " + team_name)
+        if is_admin(user):
+            with action_col:
+                with st.popover("Remove department"):
+                    st.markdown('<span class="tt-remove-dept-marker" aria-hidden="true"></span>', unsafe_allow_html=True)
+                    st.caption(f"Remove **{team_name}** from this company workspace.")
+                    confirm_remove = st.checkbox(
+                        "I understand this cannot be undone.",
+                        key=f"confirm_remove_department_{team_name}"
+                    )
+                    if st.button("Confirm removal", key=f"remove_department_{team_name}",
+                                 type="primary", disabled=not confirm_remove):
+                        assigned_members = q_one(
+                            "SELECT COUNT(*) AS total FROM users WHERE company_id=? AND team=?",
+                            (company_id, team_name)
+                        )["total"]
+                        related_tickets = q_one(
+                            "SELECT COUNT(*) AS total FROM tickets WHERE company_id=? AND team=?",
+                            (company_id, team_name)
+                        )["total"]
+                        if assigned_members or related_tickets:
+                            st.error(
+                                f"Cannot remove this department yet: {assigned_members} active member(s) "
+                                f"and {related_tickets} ticket(s) are still linked to it. "
+                                "Move members and resolve or reassign its tickets first."
+                            )
+                        else:
+                            execute("DELETE FROM teams WHERE company_id=? AND name=?",
+                                    (company_id, team_name))
+                            st.success(f"{team_name} department removed.")
+                            st.rerun()
     if is_admin(user):
         st.markdown("### Add a department")
         with st.form("add_team_form"):
