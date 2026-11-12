@@ -497,6 +497,22 @@ def notify_users(company_id, user_ids, ticket_id, message, subject="TeamTrack up
             )
 
 
+def ticket_notification_recipients(company_id, team, reporter_id=None, assignee_id=None, exclude_user_id=None):
+    """Notify only the ticket's department and the people directly involved."""
+    rows = q_all(
+        "SELECT id FROM users WHERE company_id=? AND team=? AND active=1",
+        (company_id, team)
+    )
+    recipients = {row["id"] for row in rows}
+    if reporter_id:
+        recipients.add(reporter_id)
+    if assignee_id:
+        recipients.add(assignee_id)
+    if exclude_user_id:
+        recipients.discard(exclude_user_id)
+    return sorted(recipients)
+
+
 def add_activity(ticket_id, user_id, action):
     execute(
         "INSERT INTO activity (id, ticket_id, user_id, action, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -1325,17 +1341,17 @@ elif page == "Create ticket":
                 path = UPLOAD_DIR / f"{ticket_id}_{safe_name}"
                 path.write_bytes(attachment.getbuffer())
             add_activity(ticket_id, user["id"], f"Ticket created by {user['full_name']}")
-            # Company-wide notification for new tickets, as agreed for the MVP.
-            notify_users(
-                company_id, [m["id"] for m in members], ticket_id,
-                f"New ticket {key}: {title.strip()} · Team: {team} · Priority: {priority}",
-                "New company ticket"
+            # Notify the selected department and the people directly involved only.
+            recipients = ticket_notification_recipients(
+                company_id, team, reporter_id=user["id"], assignee_id=assignee_id,
+                exclude_user_id=user["id"]
             )
-            if assignee_id:
-                notify_users(company_id, [assignee_id], ticket_id,
-                             f"You have been assigned ticket {key}: {title.strip()}",
-                             "Ticket assigned to you")
-            st.success(f"Ticket {key} created. Company members have been notified.")
+            notify_users(
+                company_id, recipients, ticket_id,
+                f"New ticket {key}: {title.strip()} · Team: {team} · Priority: {priority}",
+                "New department ticket"
+            )
+            st.success(f"Ticket {key} created. The {team} department has been notified.")
             st.session_state.page = "All tickets"
             st.rerun()
 
@@ -1423,12 +1439,11 @@ elif page == "Ticket details":
                         (str(uuid.uuid4()), ticket_id, user["id"], comment_body.strip(), now())
                     )
                     add_activity(ticket_id, user["id"], f"{user['full_name']} added a comment")
-                    recipients = {t["reporter_id"], t["assignee_id"]}
-                    team_members = q_all("SELECT id FROM users WHERE company_id=? AND team=? AND active=1",
-                                         (company_id, t["team"]))
-                    recipients.update(m["id"] for m in team_members)
-                    recipients.discard(user["id"])
-                    notify_users(company_id, list(recipients), ticket_id,
+                    recipients = ticket_notification_recipients(
+                        company_id, t["team"], reporter_id=t["reporter_id"],
+                        assignee_id=t["assignee_id"], exclude_user_id=user["id"]
+                    )
+                    notify_users(company_id, recipients, ticket_id,
                                  f"New comment on {t['ticket_key']}: {comment_body.strip()[:120]}",
                                  "Ticket comment")
                     st.rerun()
@@ -1446,7 +1461,9 @@ elif page == "Ticket details":
             can_update_work = (user["role"] in ["Admin", "IT Personnel"] or team_lead_can_access or
                                (user["role"] != "Viewer" and user["id"] in [t["reporter_id"], t["assignee_id"]]))
             can_reassign = can_assign_in_department(user, t["team"])
-            if can_update_work:
+            if t["status"] == "Closed":
+                st.info("This ticket is closed and cannot be reopened or edited. If further work is required, create a new ticket and reference this ticket ID.")
+            elif can_update_work:
                 with st.form("ticket_update_form"):
                     new_status = st.selectbox("Status", STATUSES, index=STATUSES.index(t["status"]))
                     new_priority = st.selectbox("Priority", PRIORITIES, index=PRIORITIES.index(t["priority"]))
@@ -1489,12 +1506,11 @@ elif page == "Ticket details":
                     if changed:
                         action = f"{user['full_name']} " + ", ".join(changed)
                         add_activity(ticket_id, user["id"], action)
-                        recipients = {t["reporter_id"], t["assignee_id"], new_assignee_id}
-                        team_members = q_all("SELECT id FROM users WHERE company_id=? AND team=? AND active=1",
-                                             (company_id, new_team))
-                        recipients.update(m["id"] for m in team_members)
-                        recipients.discard(user["id"])
-                        notify_users(company_id, list(recipients), ticket_id,
+                        recipients = ticket_notification_recipients(
+                            company_id, new_team, reporter_id=t["reporter_id"],
+                            assignee_id=new_assignee_id, exclude_user_id=user["id"]
+                        )
+                        notify_users(company_id, recipients, ticket_id,
                                      f"{t['ticket_key']} updated: {', '.join(changed)}",
                                      "Ticket updated")
                     st.success("Ticket updated.")
@@ -1586,53 +1602,87 @@ elif page == "Team & members":
     if not DARK_MODE:
         st.markdown("""
         <style>
-        /* Light-mode department removal controls: burgundy surface, white label. */
-        [data-testid="stPopover"] > button,
-        [data-testid="stPopover"] > div > button {
-            background:#4D0F28 !important;
-            border:1px solid #4D0F28 !important;
-            color:#FFFFFF !important;
-            border-radius:8px !important;
+        /* Light theme: every department-removal popover trigger is burgundy. */
+        [data-testid="stPopover"] button,
+        [data-testid="stPopover"] > div button {
+            background-color: #4D0F28 !important;
+            border: 1px solid #4D0F28 !important;
+            color: #FFFFFF !important;
+            border-radius: 8px !important;
         }
-        [data-testid="stPopover"] > button p,
-        [data-testid="stPopover"] > button span,
-        [data-testid="stPopover"] > div > button p,
-        [data-testid="stPopover"] > div > button span {
-            color:#FFFFFF !important;
+        [data-testid="stPopover"] button *,
+        [data-testid="stPopover"] button svg {
+            color: #FFFFFF !important;
+            fill: #FFFFFF !important;
         }
-        [data-testid="stPopover"] > button:hover,
-        [data-testid="stPopover"] > div > button:hover {
-            background:#681B39 !important;
-            border-color:#681B39 !important;
-            color:#FFFFFF !important;
+        [data-testid="stPopover"] button:hover {
+            background-color: #681B39 !important;
+            border-color: #681B39 !important;
         }
-        /* Scope the confirmation panel using a marker rendered inside this
-           specific popover. Streamlit places popover content in a portal. */
+
+        /* Streamlit renders popover content in an overlay/portal. Match the
+           overlay containing our marker, with fallbacks for Streamlit DOM versions. */
         [data-baseweb="popover"]:has(.tt-remove-dept-marker),
+        [data-testid="stPopoverBody"]:has(.tt-remove-dept-marker),
+        [role="dialog"]:has(.tt-remove-dept-marker),
         [data-baseweb="popover"]:has(.tt-remove-dept-marker) > div,
-        [data-baseweb="popover"]:has(.tt-remove-dept-marker) [data-testid="stPopoverBody"] {
-            background:#4D0F28 !important;
-            border-color:#4D0F28 !important;
-            color:#FFFFFF !important;
+        [data-testid="stPopoverBody"]:has(.tt-remove-dept-marker) > div,
+        [role="dialog"]:has(.tt-remove-dept-marker) > div {
+            background-color: #4D0F28 !important;
+            border-color: #4D0F28 !important;
+            color: #FFFFFF !important;
         }
         [data-baseweb="popover"]:has(.tt-remove-dept-marker) *,
+        [data-testid="stPopoverBody"]:has(.tt-remove-dept-marker) *,
+        [role="dialog"]:has(.tt-remove-dept-marker) *,
         [data-baseweb="popover"]:has(.tt-remove-dept-marker) *::before,
-        [data-baseweb="popover"]:has(.tt-remove-dept-marker) *::after {
-            color:#FFFFFF !important;
+        [data-testid="stPopoverBody"]:has(.tt-remove-dept-marker) *::before,
+        [role="dialog"]:has(.tt-remove-dept-marker) *::before {
+            color: #FFFFFF !important;
         }
-        [data-baseweb="popover"]:has(.tt-remove-dept-marker) [data-testid="stCheckbox"] svg {
-            color:#FFFFFF !important;
-            fill:#FFFFFF !important;
+        [data-baseweb="popover"]:has(.tt-remove-dept-marker) [data-testid="stCheckbox"] label,
+        [data-baseweb="popover"]:has(.tt-remove-dept-marker) [data-testid="stCheckbox"] label *,
+        [data-testid="stPopoverBody"]:has(.tt-remove-dept-marker) [data-testid="stCheckbox"] label,
+        [data-testid="stPopoverBody"]:has(.tt-remove-dept-marker) [data-testid="stCheckbox"] label *,
+        [role="dialog"]:has(.tt-remove-dept-marker) [data-testid="stCheckbox"] label,
+        [role="dialog"]:has(.tt-remove-dept-marker) [data-testid="stCheckbox"] label * {
+            color: #FFFFFF !important;
         }
-        [data-baseweb="popover"]:has(.tt-remove-dept-marker) button[kind="primary"] {
-            background:#FFFFFF !important;
-            border-color:#FFFFFF !important;
-            color:#4D0F28 !important;
+        [data-baseweb="popover"]:has(.tt-remove-dept-marker) button,
+        [data-testid="stPopoverBody"]:has(.tt-remove-dept-marker) button,
+        [role="dialog"]:has(.tt-remove-dept-marker) button {
+            background-color: #681B39 !important;
+            border-color: #FFFFFF !important;
+            color: #FFFFFF !important;
         }
-        [data-baseweb="popover"]:has(.tt-remove-dept-marker) button[kind="primary"] *,
-        [data-baseweb="popover"]:has(.tt-remove-dept-marker) button[kind="primary"] svg {
-            color:#4D0F28 !important;
-            fill:#4D0F28 !important;
+        [data-baseweb="popover"]:has(.tt-remove-dept-marker) button *,
+        [data-testid="stPopoverBody"]:has(.tt-remove-dept-marker) button *,
+        [role="dialog"]:has(.tt-remove-dept-marker) button * {
+            color: #FFFFFF !important;
+            fill: #FFFFFF !important;
+        }
+        /* The final destructive-action confirmation uses a white button
+           with burgundy text, while the surrounding popover stays burgundy. */
+        [data-baseweb="popover"]:has(.tt-remove-dept-marker) [data-testid="stButton"] button,
+        [data-testid="stPopoverBody"]:has(.tt-remove-dept-marker) [data-testid="stButton"] button,
+        [role="dialog"]:has(.tt-remove-dept-marker) [data-testid="stButton"] button {
+            background-color: #FFFFFF !important;
+            background: #FFFFFF !important;
+            border: 1px solid #FFFFFF !important;
+            color: #4D0F28 !important;
+        }
+        [data-baseweb="popover"]:has(.tt-remove-dept-marker) [data-testid="stButton"] button *,
+        [data-testid="stPopoverBody"]:has(.tt-remove-dept-marker) [data-testid="stButton"] button *,
+        [role="dialog"]:has(.tt-remove-dept-marker) [data-testid="stButton"] button * {
+            color: #4D0F28 !important;
+            fill: #4D0F28 !important;
+        }
+        [data-baseweb="popover"]:has(.tt-remove-dept-marker) [data-testid="stButton"] button:hover,
+        [data-testid="stPopoverBody"]:has(.tt-remove-dept-marker) [data-testid="stButton"] button:hover,
+        [role="dialog"]:has(.tt-remove-dept-marker) [data-testid="stButton"] button:hover {
+            background-color: #F4E9ED !important;
+            background: #F4E9ED !important;
+            border-color: #FFFFFF !important;
         }
         </style>
         """, unsafe_allow_html=True)
